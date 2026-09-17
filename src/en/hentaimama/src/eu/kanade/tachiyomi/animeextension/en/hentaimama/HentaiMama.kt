@@ -182,7 +182,7 @@ class HentaiMama :
 
     // Latest
 
-    override fun latestUpdatesSelector(): String = "article.tvshows"
+    override fun latestUpdatesSelector(): String = "article.series-card"
 
     override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/tvshows/page/$page/")
 
