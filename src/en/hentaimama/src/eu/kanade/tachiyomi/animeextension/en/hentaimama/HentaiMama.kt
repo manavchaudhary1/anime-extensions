@@ -93,42 +93,46 @@ class HentaiMama :
         val referer = response.request.url.toString()
         val ajaxHeaders = Headers.headersOf("Referer", referer)
         return document.select(".dt-mi-tabs a[href^='#option-']").flatMap { option ->
-            val optionId = option.attr("href").substringAfter("#option-").toIntOrNull()
-                ?: return@flatMap emptyList()
-            val body = FormBody.Builder()
-                .add("action", "get_player_contents")
-                .add("a", postId)
-                .add("i", optionId.toString())
-                .build()
-            val playerHtml = client.newCall(POST("$baseUrl/wp-admin/admin-ajax.php", ajaxHeaders, body))
-                .execute().parseAs<List<String>>().getOrNull(optionId - 1)
-                ?: return@flatMap emptyList()
-            val embedUrl = Jsoup.parseBodyFragment(playerHtml, baseUrl)
-                .selectFirst("iframe[src]")?.absUrl("src")
-                ?: return@flatMap emptyList()
-            val embedDocument = client.newCall(GET(embedUrl)).execute().asJsoup()
-            val sources = embedDocument.select("script").firstNotNullOfOrNull {
-                SOURCES_ARRAY_REGEX.find(it.data())?.groupValues?.get(1)
-            }?.parseAs<List<PlayerSource>>() ?: return@flatMap emptyList()
+            runCatching {
+                val optionId = option.attr("href").substringAfter("#option-").toIntOrNull()
+                    ?: return@runCatching emptyList()
+                val body = FormBody.Builder()
+                    .add("action", "get_player_contents")
+                    .add("a", postId)
+                    .add("i", optionId.toString())
+                    .build()
+                val playerHtml = client.newCall(POST("$baseUrl/wp-admin/admin-ajax.php", ajaxHeaders, body))
+                    .execute().parseAs<List<String>>().getOrNull(optionId - 1)
+                    ?: return@runCatching emptyList()
+                val embedUrl = Jsoup.parseBodyFragment(playerHtml, baseUrl)
+                    .selectFirst("iframe[src]")?.absUrl("src")
+                    ?: return@runCatching emptyList()
+                val embedDocument = client.newCall(GET(embedUrl)).execute().asJsoup()
+                val sources = embedDocument.select("script").firstNotNullOfOrNull {
+                    SOURCES_ARRAY_REGEX.find(it.data())?.groupValues?.get(1)
+                }?.parseAs<List<PlayerSource>>() ?: return@runCatching emptyList()
 
-            sources.flatMap { source ->
-                val title = listOfNotNull(option.text(), source.label).joinToString(" - ")
-                val videoHeaders = Headers.headersOf("Referer", embedUrl)
-                val fallback = listOf(
-                    Video(source.file, title, source.file, headers = videoHeaders),
-                )
+                sources.flatMap { source ->
+                    val title = listOfNotNull(option.text(), source.label).joinToString(" - ")
+                    val videoHeaders = Headers.headersOf("Referer", embedUrl)
+                    val fallback = listOf(
+                        Video(source.file, title, source.file, headers = videoHeaders),
+                    )
 
-                if (source.type.equals("hls", ignoreCase = true) || ".m3u8" in source.file) {
-                    runCatching {
-                        playlistUtils.extractFromHls(
-                            playlistUrl = source.file,
-                            referer = embedUrl,
-                            videoNameGen = { quality -> "${option.text()} - $quality" },
-                        )
-                    }.getOrNull()?.takeIf { it.isNotEmpty() } ?: fallback
-                } else {
-                    fallback
+                    if (source.type.equals("hls", ignoreCase = true) || ".m3u8" in source.file) {
+                        runCatching {
+                            playlistUtils.extractFromHls(
+                                playlistUrl = source.file,
+                                referer = embedUrl,
+                                videoNameGen = { quality -> "${option.text()} - $quality" },
+                            )
+                        }.getOrNull()?.takeIf { it.isNotEmpty() } ?: fallback
+                    } else {
+                        fallback
+                    }
                 }
+            }.getOrElse {
+                emptyList()
             }
         }
     }
@@ -143,11 +147,22 @@ class HentaiMama :
 
     override fun videoListSelector() = throw UnsupportedOperationException()
 
+    private fun getPreferredMirror(): String {
+        val savedValue = preferences.getString(PREF_MIRROR_KEY, PREF_MIRROR_DEFAULT)
+            ?: PREF_MIRROR_DEFAULT
+        val migratedValue = LEGACY_MIRROR_VALUES[savedValue] ?: savedValue
+
+        if (migratedValue != savedValue) {
+            preferences.edit().putString(PREF_MIRROR_KEY, migratedValue).apply()
+        }
+
+        return migratedValue
+    }
+
     override fun List<Video>.sortVideos(): List<Video> {
         val preferredQuality = preferences.getString(PREF_VIDEO_QUALITY_KEY, PREF_VIDEO_QUALITY_DEFAULT)
             ?: PREF_VIDEO_QUALITY_DEFAULT
-        val preferredMirror = preferences.getString(PREF_MIRROR_KEY, PREF_MIRROR_DEFAULT)
-            ?: PREF_MIRROR_DEFAULT
+        val preferredMirror = getPreferredMirror()
 
         return sortedWith(
             compareByDescending<Video> { it.videoTitle.contains(preferredQuality, ignoreCase = true) }
@@ -209,6 +224,8 @@ class HentaiMama :
     // Settings
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        getPreferredMirror()
+
         screen.addListPreference(
             key = PREF_VIDEO_QUALITY_KEY,
             title = "Preferred Quality",
@@ -548,6 +565,12 @@ class HentaiMama :
         private const val PREF_MIRROR_KEY = "preferred_quality"
         private const val PREF_MIRROR_DEFAULT = "mi-1"
         private val PREF_MIRROR_ENTRIES = listOf("mi-1", "mi-2", "mi-3")
+        private val LEGACY_MIRROR_VALUES = mapOf(
+            "Mirror 1" to "mi-1",
+            "Mirror 2" to "mi-2",
+            "Mirror 3" to "mi-3",
+            "Beta" to PREF_MIRROR_DEFAULT,
+        )
         private val SOURCES_ARRAY_REGEX = Regex("""sources:\s*(\[.+?])""", RegexOption.DOT_MATCHES_ALL)
     }
 }
