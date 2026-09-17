@@ -1,7 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.en.hentaimama
 
-import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
+import aniyomi.lib.playlistutils.PlaylistUtils
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -12,6 +12,7 @@ import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.ParsedAnimeHttpLegacySource
+import keiyoushi.utils.addListPreference
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
@@ -24,6 +25,7 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Locale
 
 class HentaiMama :
@@ -40,6 +42,8 @@ class HentaiMama :
 
     private val preferences by getPreferencesLazy()
 
+    private val playlistUtils by lazy { PlaylistUtils(client, headers) }
+
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .add("Referer", baseUrl)
 
@@ -47,7 +51,9 @@ class HentaiMama :
 
     override fun popularAnimeSelector(): String = "article.series-card"
 
-    override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/advance-search/page/$page/?submit=Submit&filter=weekly")
+    override fun popularAnimeRequest(page: Int): Request = GET(
+        if (page == 1) "$baseUrl/hentai-series/?filter=weekly" else "$baseUrl/hentai-series/page/$page/?filter=weekly",
+    )
 
     private fun animeFromElement(element: Element): SAnime {
         val anime = SAnime.create()
@@ -86,8 +92,6 @@ class HentaiMama :
             ?: return emptyList()
         val referer = response.request.url.toString()
         val ajaxHeaders = Headers.headersOf("Referer", referer)
-        val sourcesRegex = Regex("""sources:\s*(\[[^]]+])""")
-
         return document.select(".dt-mi-tabs a[href^='#option-']").flatMap { option ->
             val optionId = option.attr("href").substringAfter("#option-").toIntOrNull()
                 ?: return@flatMap emptyList()
@@ -104,12 +108,27 @@ class HentaiMama :
                 ?: return@flatMap emptyList()
             val embedDocument = client.newCall(GET(embedUrl)).execute().asJsoup()
             val sources = embedDocument.select("script").firstNotNullOfOrNull {
-                sourcesRegex.find(it.data())?.groupValues?.get(1)
+                SOURCES_ARRAY_REGEX.find(it.data())?.groupValues?.get(1)
             }?.parseAs<List<PlayerSource>>() ?: return@flatMap emptyList()
 
-            sources.map { source ->
+            sources.flatMap { source ->
                 val title = listOfNotNull(option.text(), source.label).joinToString(" - ")
-                Video(source.file, title, source.file, headers = Headers.headersOf("Referer", embedUrl))
+                val videoHeaders = Headers.headersOf("Referer", embedUrl)
+                val fallback = listOf(
+                    Video(source.file, title, source.file, headers = videoHeaders),
+                )
+
+                if (source.type.equals("hls", ignoreCase = true) || ".m3u8" in source.file) {
+                    runCatching {
+                        playlistUtils.extractFromHls(
+                            playlistUrl = source.file,
+                            referer = embedUrl,
+                            videoNameGen = { quality -> "${option.text()} - $quality" },
+                        )
+                    }.getOrNull()?.takeIf { it.isNotEmpty() } ?: fallback
+                } else {
+                    fallback
+                }
             }
         }
     }
@@ -125,21 +144,15 @@ class HentaiMama :
     override fun videoListSelector() = throw UnsupportedOperationException()
 
     override fun List<Video>.sortVideos(): List<Video> {
-        val quality = preferences.getString("preferred_quality", null)
-        if (quality != null) {
-            val newList = mutableListOf<Video>()
-            var preferred = 0
-            for (video in this) {
-                if (video.videoTitle.contains(quality)) {
-                    newList.add(preferred, video)
-                    preferred++
-                } else {
-                    newList.add(video)
-                }
-            }
-            return newList
-        }
-        return this
+        val preferredQuality = preferences.getString(PREF_VIDEO_QUALITY_KEY, PREF_VIDEO_QUALITY_DEFAULT)
+            ?: PREF_VIDEO_QUALITY_DEFAULT
+        val preferredMirror = preferences.getString(PREF_MIRROR_KEY, PREF_MIRROR_DEFAULT)
+            ?: PREF_MIRROR_DEFAULT
+
+        return sortedWith(
+            compareByDescending<Video> { it.videoTitle.contains(preferredQuality, ignoreCase = true) }
+                .thenByDescending { it.videoTitle.contains(preferredMirror, ignoreCase = true) },
+        )
     }
 
     override fun videoFromElement(element: Element) = throw UnsupportedOperationException()
@@ -172,6 +185,7 @@ class HentaiMama :
         anime.author = document.select(".dt-show-card .dsc-stat")
             .firstOrNull { it.select("span").text() == "Studio" }
             ?.select("b")?.text()
+            ?.takeUnless { it.isBlank() || it == "—" }
         anime.status = if (document.selectFirst(".dt-show-card .dsc-chip.is-airing") != null) {
             SAnime.ONGOING
         } else {
@@ -184,7 +198,9 @@ class HentaiMama :
 
     override fun latestUpdatesSelector(): String = "article.series-card"
 
-    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/tvshows/page/$page/")
+    override fun latestUpdatesRequest(page: Int): Request = GET(
+        if (page == 1) "$baseUrl/hentai-series/?filter=recent" else "$baseUrl/hentai-series/page/$page/?filter=recent",
+    )
 
     override fun latestUpdatesFromElement(element: Element): SAnime = animeFromElement(element)
 
@@ -193,22 +209,23 @@ class HentaiMama :
     // Settings
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        val videoQualityPref = ListPreference(screen.context).apply {
-            key = PREF_QUALITY_KEY
-            title = PREF_QUALITY_TITLE
-            entries = PREF_QUALITY_ENTRIES
-            entryValues = PREF_QUALITY_ENTRIES
-            setDefaultValue("mi-1")
-            summary = "%s"
+        screen.addListPreference(
+            key = PREF_VIDEO_QUALITY_KEY,
+            title = "Preferred Quality",
+            entries = PREF_VIDEO_QUALITY_ENTRIES,
+            entryValues = PREF_VIDEO_QUALITY_ENTRIES,
+            default = PREF_VIDEO_QUALITY_DEFAULT,
+            summary = "%s",
+        )
 
-            setOnPreferenceChangeListener { _, newValue ->
-                val selected = newValue as String
-                val index = findIndexOfValue(selected)
-                val entry = entryValues[index] as String
-                preferences.edit().putString(key, entry).commit()
-            }
-        }
-        screen.addPreference(videoQualityPref)
+        screen.addListPreference(
+            key = PREF_MIRROR_KEY,
+            title = "Preferred Mirror",
+            entries = PREF_MIRROR_ENTRIES,
+            entryValues = PREF_MIRROR_ENTRIES,
+            default = PREF_MIRROR_DEFAULT,
+            summary = "%s",
+        )
     }
 
     // Filters
@@ -320,41 +337,10 @@ class HentaiMama :
 
     internal class Year(val id: String) : AnimeFilter.CheckBox(id)
     private class YearList(years: List<Year>) : AnimeFilter.Group<Year>("Year", years)
-    private fun getYears() = listOf(
-        Year("2022"),
-        Year("2021"),
-        Year("2020"),
-        Year("2019"),
-        Year("2018"),
-        Year("2017"),
-        Year("2016"),
-        Year("2015"),
-        Year("2014"),
-        Year("2013"),
-        Year("2012"),
-        Year("2011"),
-        Year("2010"),
-        Year("2009"),
-        Year("2008"),
-        Year("2007"),
-        Year("2006"),
-        Year("2005"),
-        Year("2004"),
-        Year("2003"),
-        Year("2002"),
-        Year("2001"),
-        Year("2000"),
-        Year("1999"),
-        Year("1998"),
-        Year("1997"),
-        Year("1996"),
-        Year("1995"),
-        Year("1994"),
-        Year("1993"),
-        Year("1992"),
-        Year("1991"),
-        Year("1987"),
-    )
+    private fun getYears(): List<Year> {
+        val currentYear = Calendar.getInstance().get(Calendar.YEAR)
+        return (currentYear downTo 1987).map { Year(it.toString()) }
+    }
 
     internal class Producer(val id: String) : AnimeFilter.CheckBox(id)
     private class ProducerList(producers: List<Producer>) : AnimeFilter.Group<Producer>("Producer", producers)
@@ -556,8 +542,12 @@ class HentaiMama :
     )
 
     companion object {
-        private const val PREF_QUALITY_KEY = "preferred_quality"
-        private const val PREF_QUALITY_TITLE = "Preferred mirror"
-        private val PREF_QUALITY_ENTRIES = arrayOf("mi-1", "mi-2", "mi-3")
+        private const val PREF_VIDEO_QUALITY_KEY = "preferred_video_quality"
+        private const val PREF_VIDEO_QUALITY_DEFAULT = "1080p"
+        private val PREF_VIDEO_QUALITY_ENTRIES = listOf("1080p", "720p", "480p")
+        private const val PREF_MIRROR_KEY = "preferred_quality"
+        private const val PREF_MIRROR_DEFAULT = "mi-1"
+        private val PREF_MIRROR_ENTRIES = listOf("mi-1", "mi-2", "mi-3")
+        private val SOURCES_ARRAY_REGEX = Regex("""sources:\s*(\[.+?])""", RegexOption.DOT_MATCHES_ALL)
     }
 }
